@@ -14,68 +14,186 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+
 import csv
-import pywt
+
 import torch
-import time
+import pywt
 import numpy as np
 import scipy as sp
 import matplotlib.pyplot as plt
 
 from torch_geometric.data import Data
-from torch_geometric.nn import (
-    GCNConv,
-    GATConv,
-    GraphConv,
-)
 from torch_geometric.utils import to_undirected
+from torch_geometric.nn import GCNConv
 
-def tsv_file_to_list(
+
+
+class GCNModel(torch.nn.Module):
+    def __init__(self,
+                 data,
+                 optimizer = None,
+                 criterion = None,
+                 activation = None,
+                 dropout = None,
+                 hidden1 = 8,
+                 hidden2 = 4):
+        super().__init__()
+        self.data = data
+        self.conv1 = GCNConv(data.x.shape[1], hidden1)
+        self.conv2 = GCNConv(hidden1, hidden2)
+        self.conv3 = GCNConv(hidden2, data.class_count)
+
+        if optimizer is None:
+            optimizer = torch.optim.Adam(self.parameters())
+
+        if criterion is None:
+            criterion = torch.nn.CrossEntropyLoss()
+
+        if activation is None:
+            activation = torch.nn.ReLU()
+
+        if dropout is None:
+            dropout = torch.nn.Dropout()
+
+        self.optimizer = optimizer
+        self.criterion = criterion
+        self.activation = activation
+        self.dropout = dropout
+
+    def forward(self, x = None):
+        if x is None:
+            x = self.data.x
+
+        x = self.conv1(
+            x,
+            self.data.edge_index,
+            self.data.edge_attr)
+        x = self.activation(x)
+        x = self.dropout(x)
+
+        x = self.conv2(
+            x,
+            self.data.edge_index,
+            self.data.edge_attr)
+        x = self.activation(x)
+        x = self.dropout(x)
+
+        x = self.conv3(
+            x,
+            self.data.edge_index,
+            self.data.edge_attr)
+        return x
+
+    def go_training(self, epoch):
+        def train_once():
+            self.optimizer.zero_grad()
+            out = self()
+            loss = self.criterion(
+                out[self.data.train_mask],
+                self.data.y[self.data.train_mask])
+            loss.backward()
+            self.optimizer.step()
+
+            return loss
+
+        self.train()
+        for i in range(epoch):
+            loss = train_once()
+            print(f"Epoch {i + 1}: loss = {loss:.5f}")
+
+    def go_testing(self):
+        self.eval()
+
+        out = self()
+        pred = out.argmax(dim = 1)[self.data.test_mask]
+        labels = self.data.y[self.data.test_mask]
+        correct = pred == labels
+
+        tp = 0
+        tn = 0
+        fp = 0
+        fn = 0
+
+        for i, val in enumerate(correct):
+            true_label = labels[i]
+            if val and true_label == 0:
+                tn += 1
+            elif val and true_label == 1:
+                tp += 1
+            elif true_label == 0:
+                fp += 1
+            else:
+                fn += 1
+
+        accuracy = (tp+tn) / len(correct)
+        precision = tp / (tp+fp)
+        recall = tp / (tp+fn)
+        f1_score = 2*precision*recall / (recall+precision)
+
+        return {
+            "tp": tp,
+            "tn": tn,
+            "fp": fp,
+            "fn": fn,
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1_score}
+
+
+
+def read_signals_from_tsv(
         path,
         delimiter = "\t",
-        transform_fn = lambda x: x
-):
-    result = []
-
-    with open(path) as tsv:
-        for row in csv.reader(tsv, delimiter = delimiter):
-            result.append([transform_fn(x) for x in row])
+        transformer = lambda x: x):
+    with open(path, "r", encoding = "utf-8") as f:
+        result = []
+        reader = csv.reader(
+            f,
+            delimiter = delimiter)
+        for row in reader:
+            result.append([transformer(x) for x in row])
 
     return result
+
 
 def split_signals(signals, n = 200):
     result = []
     temp = []
 
     for i, signal in enumerate(signals):
-        if i != 0 and i % n == 0:
+        if i > 0 and i % n == 0:
             result.append(temp)
             temp = []
+
         temp.append(signal)
 
-    if len(temp) != 0:
+    if temp:
         result.append(temp)
 
     return result
 
-def signal_to_feature(signal):
-    def helper_fn(sig):
-        std_deviation = np.std(sig)
-        peak = max(sig)
-        skewness = sp.stats.skew(sig)
-        kurtosis = sp.stats.kurtosis(sig)
-        rms = np.sqrt(np.sum(sig ** 2) / len(sig))
+
+def calc_feature(signal):
+    def calc_helper(signal):
+        signal = np.array([
+            sum(xyz) / 3
+            for xyz in signal])
+        std_deviation = np.std(signal)
+        peak = max(signal)
+        skewness = sp.stats.skew(signal)
+        kurtosis = sp.stats.kurtosis(signal)
+        rms = np.sqrt(np.sum(signal**2) / len(signal))
         crest_factor = peak / rms
-        shape_factor = rms / np.sum(np.abs(sig))
+        shape_factor = rms / np.sum(np.abs(signal))
         impulse_factor = (
-            peak / (np.sum(np.abs(sig)) / len(sig))
-        )
+            peak / (np.sum(np.abs(signal))/len(signal)))
 
         wp = pywt.WaveletPacket(
-            data = sig,
+            data = signal,
             wavelet = "db20",
-            maxlevel = 3
-        )
+            maxlevel = 3)
         datas = [np.sum(np.abs(node.data))
                      for node in wp.get_level(3)]
         total = sum(datas)
@@ -90,51 +208,44 @@ def signal_to_feature(signal):
                 rms,
                 crest_factor,
                 shape_factor,
-                impulse_factor,
-            ],
-            wpd
-        ))
+                impulse_factor],
+            wpd))
 
-    return sum(map(helper_fn, np.array(signal).T))
+    return np.array(
+        [calc_helper(group) for group in signal])
 
-def calc_adj_mat(features, top_k = 5):
+
+def calc_adj_matrix(features, k = 5):
     def calc_distance(a, b):
         return np.sum(np.abs(a - b))
 
-    distance_mat = [
-        [calc_distance(a, b) for b in features]
-        for a in features
-    ]
+    distances = np.array(
+        [[calc_distance(a, b) for b in features]
+        for a in features])
 
-    adj_mat = []
-    for i, distances in enumerate(distance_mat):
-        sorted_args = np.argsort(distances)
-        assert i == sorted_args[0]
-        sorted_args = sorted_args[1:1 + top_k]
+    result = np.zeros(distances.shape)
+    for i, dists in enumerate(distances):
+        result[i][i] = 1
 
-        total_dist = np.sum([
-            distances[x] for x in sorted_args
-        ])
+        sorted_indexes = np.argsort(dists)
+        assert sorted_indexes[0] == i
 
-        result = np.zeros(len(distances))
-        result[i] = 1
+        needed_indexes = sorted_indexes[1 : k + 1]
+        needed_dists = dists[needed_indexes]
+        needed_dists /= np.sum(needed_dists)
 
-        for j in sorted_args:
-            result[j] = distances[j] / total_dist
+        result[i][needed_indexes] = needed_dists
 
-        adj_mat.append(result)
+    return result
 
-    return np.array(adj_mat)
 
 def calc_edge_index_and_attr(
-        adj_mat,
-        need_undirected = False,
-        **kwargs
-):
+        adj_matrix,
+        undirected = True):
     edge_index = [[], []]
     edge_attr = []
 
-    for i, weights in enumerate(adj_mat):
+    for i, weights in enumerate(adj_matrix):
         for j, weight in enumerate(weights):
             if j == i or weight <= 0:
                 continue
@@ -146,237 +257,125 @@ def calc_edge_index_and_attr(
     edge_index = torch.tensor(edge_index, dtype = int)
     edge_attr = torch.tensor(edge_attr, dtype = torch.double)
 
-    if need_undirected:
-        return to_undirected(edge_index, edge_attr, **kwargs)
+    if undirected:
+        return to_undirected(edge_index, edge_attr)
     else:
         return edge_index, edge_attr
 
-def train(data, model, optimizer, criterion):
-    model.train()
-    optimizer.zero_grad()
 
-    out = model(data)
-    loss = criterion(
-        out[data.train_mask],
-        data.y[data.train_mask]
-    )
-    loss.backward()
-    optimizer.step()
+
+def plot_raw_signals(
+        signals,
+        fig = None,
+        file_path = None):
+    if fig is None:
+        fig = plt.figure(layout = "tight")
 
-    return loss
+    fig.set_title("Raw signal")
+    xyzs = [
+        [p[0] for p in signals],
+        [p[1] for p in signals],
+        [p[2] for p in signals]]
+    subplots = [
+        fig.add_subplot(2, 2, i + 1)
+        for i in range(3)]
 
-def test(data, model):
-    model.eval()
+    stuffs = zip(("x", "y", "z"), xyzs, subplots)
+    for title, data, subplot in stuffs:
+        subplot.set_title(title)
+        subplot.plot(data)
 
-    out = model(data)
-    pred = out.argmax(dim = 1)
+    if file_path is not None:
+        fig.savefig(file_path)
+    else:
+        fig.show()
 
-    correct = pred[data.test_mask] == data.y[data.test_mask]
 
-    tp = 0
-    tn = 0
-    fp = 0
-    fn = 0
-    for i, val in enumerate(correct):
-        signal_class = data.y[data.test_mask][i]
-        if val and signal_class == 0:
-            tn += 1
-        elif val and signal_class == 1:
-            tp += 1
-        elif signal_class == 0:
-            fp += 1
-        else:
-            fn += 1
+def plot_features(
+        features,
+        fig = None,
+        file_path = None):
+    if fig is None:
+        fig = plt.figure(layout = "tight")
 
-    accuracy = (tp + tn) / len(correct)
-    precision = tp / (tp + fp)
-    recall = tp / (tp + fn)
-    f1_score = 2 * precision * recall / (recall + precision)
+    ax = fig.add_subplot()
+    ax.set_title("Features")
+    cax = ax.imshow(
+        features,
+        aspect = "auto",
+        interpolation = "none")
+    cbar = fig.colorbar(cax)
 
-    return {
-        'true_positive': tp,
-        'true_negative': tn,
-        'false_positive': fp,
-        'false_negative': fn,
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1_score': f1_score,
-    }
+    if file_path is not None:
+        fig.savefig(file_path)
+    else:
+        fig.show()
 
-def train_and_test(
-        data,
-        model,
-        optimizer = None,
-        criterion = None,
-        epoch = 500,
-        print_epoch = False,
-):
-    if optimizer is None:
-        optimizer = torch.optim.Adam(model.parameters(), lr = 0.01)
 
-    if criterion is None:
-        criterion = torch.nn.CrossEntropyLoss()
+def plot_adj_matrix(
+        adj_matrix,
+        fig = None,
+        file_path = None):
+    if fig is None:
+        fig = plt.figure(layout = "tight")
 
-    for i in range(epoch):
-        loss = train(data, model, optimizer, criterion)
-        if print_epoch:
-            print(f"Epoch {i + 1}: loss = {loss:.5f}")
+    ax = fig.add_subplot()
+    ax.set_title("Adjacent Matrix")
+    cax = ax.imshow(
+        adj_matrix,
+        aspect = "auto",
+        interpolation = "none")
+    cbar = fig.colorbar(cax)
 
-    return test(data, model)
+    if file_path is not None:
+        fig.savefig(file_path)
+    else:
+        fig.show()
 
-def run_model_test(
-        model_constructor,
-        data,
-        test_n,
-        **kwargs
-):
-    scores = {
-        k: 0 for k in ['accuracy', 'precision', 'recall', 'f1_score']
-    }
 
-    for _ in range(test_n):
-        model = model_constructor(data)
-        test_result = train_and_test(
-            model = model,
-            data = data,
-            **kwargs
-        )
-        for k in scores:
-            scores[k] += test_result[k]
+def plot_confusion_matrix(
+        model_result,
+        fig = None,
+        file_path = None):
+    if fig is None:
+        fig = plt.figure(layout = "tight")
 
-    return {
-        k: scores[k] / test_n for k in scores
-    }
+    ax = fig.add_subplot()
+    ax.set_title("Confusion matrix")
+    confusion_matrix = [
+        [model_result["tp"], model_result["fn"]],
+        [model_result["fp"], model_result["tn"]]]
+    cax = ax.imshow(confusion_matrix)
+    cbar = fig.colorbar(cax)
 
-def benchmark_model(config_number, **kwargs):
-    start = time.time()
-    result = run_model_test(**kwargs)
-    duration = time.time() - start
+    ticks = ["Positive", "Negative"]
+    ax.set_xticks(np.arange(len(ticks)), labels = ticks)
+    ax.set_yticks(np.arange(len(ticks)), labels = ticks)
 
-    print(f"---- Config {config_number:02} ----")
-    print(f"Training and testing took {duration:.1f} second(s).")
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("Actual")
 
-    for k, v in result.items():
-        print(f"{k:<15} = {v:.5f}")
+    if file_path is not None:
+        fig.savefig(file_path)
+    else:
+        fig.show()
 
-    print()
-    return result
 
-class GCNConvOnly(torch.nn.Module):
-    def __init__(
-            self,
-            data,
-            hidden1 = 8,
-            hidden2 = 4
-    ):
-        super().__init__()
-        self.conv1 = GCNConv(len(data.x[0]), hidden1)
-        self.conv2 = GCNConv(hidden1, hidden2)
-        self.conv3 = GCNConv(hidden2, data.class_count)
-
-    def forward(self, data):
-        activation_fn = torch.nn.ELU()
-        dropout_fn = torch.nn.Dropout(p = 0.25)
-
-        x = self.conv1(data.x, data.edge_index, data.edge_attr)
-        x = activation_fn(x)
-        x = dropout_fn(x)
-
-        x = self.conv2(x, data.edge_index, data.edge_attr)
-        x = activation_fn(x)
-        x = dropout_fn(x)
-
-        x = self.conv3(x, data.edge_index, data.edge_attr)
-
-        return x
-
-class GraphConvOnly(torch.nn.Module):
-    def __init__(
-            self,
-            data,
-            hidden1 = 8,
-            hidden2 = 4
-    ):
-        super().__init__()
-        self.conv1 = GraphConv(len(data.x[0]), hidden1)
-        self.conv2 = GraphConv(hidden1, hidden2)
-        self.conv3 = GraphConv(hidden2, data.class_count)
-
-    def forward(self, data):
-        activation_fn = torch.nn.ELU()
-        dropout_fn = torch.nn.Dropout(p = 0.25)
-
-        x = self.conv1(data.x, data.edge_index, data.edge_attr)
-        x = activation_fn(x)
-        x = dropout_fn(x)
-
-        x = self.conv2(x, data.edge_index, data.edge_attr)
-        x = activation_fn(x)
-        x = dropout_fn(x)
-
-        x = self.conv3(x, data.edge_index, data.edge_attr)
-
-        return x
-
-class GATConvOnly(torch.nn.Module):
-    def __init__(
-            self,
-            data,
-            hidden1 = 8,
-            hidden2 = 4
-    ):
-        super().__init__()
-        self.conv1 = GATConv(len(data.x[0]), hidden1)
-        self.conv2 = GATConv(hidden1, hidden2)
-        self.conv3 = GATConv(hidden2, data.class_count)
-
-    def forward(self, data):
-        activation_fn = torch.nn.ELU()
-        dropout_fn = torch.nn.Dropout(p = 0.25)
-
-        x = self.conv1(data.x, data.edge_index, data.edge_attr)
-        x = activation_fn(x)
-        x = dropout_fn(x)
-
-        x = self.conv2(x, data.edge_index, data.edge_attr)
-        x = activation_fn(x)
-        x = dropout_fn(x)
-
-        x = self.conv3(x, data.edge_index, data.edge_attr)
-
-        return x
-
-# ----------------
-
+
 torch.set_default_dtype(torch.double)
-plt.figure(figsize = (16, 16), dpi = 512)
-plt.tight_layout()
 
-signals = tsv_file_to_list(
-    path = "../signals/signal-new.tsv",
-    transform_fn = float
-)
-
-xyzs = [[p[i] for p in signals] for i in range(3)]
-
-signals = split_signals(signals)
-
-features = np.array([
-    signal_to_feature(signal) for signal in signals
-])
-
-x_labels = [x + 1 for x in range(len(features[0]))]
+signal_file = "../signals/signal-new.tsv"
+signal_raw = read_signals_from_tsv(
+    signal_file,
+    transformer = float)
+signal_splited = split_signals(signal_raw)
+features = calc_feature(signal_splited)
 
 status_labels = {
-    'standby': 0,
-    'grinding': 1,
-}
-
+    "standby": 0,
+    "grinding": 1}
 feature_labels = []
 for i, _ in enumerate(features):
-    label = None
-
     if i >= 0 and i < 15:
         label = status_labels['standby']
     elif i >= 15 and i < 200:
@@ -396,135 +395,85 @@ for i, _ in enumerate(features):
     else:
         label = status_labels['standby']
 
-    assert label is not None
     feature_labels.append(label)
-
 feature_labels = torch.tensor(feature_labels, dtype = int)
 
-adj_mat = calc_adj_mat(features)
+adj_matrix = calc_adj_matrix(features)
 
-for axis, points in zip(['x', 'y', 'z'], xyzs):
-    plt.clf()
-    plt.title(f"Raw signal - {axis}")
-    plt.plot(points)
-    plt.savefig(f"../plots/raw-{axis}.png", bbox_inches = 'tight')
-
-# plt.clf()
-# plt.title("Feature matrix")
-# plt.pcolormesh(features, cmap = 'viridis')
-# plt.colorbar()
-# plt.xticks(
-#     ticks = [x - 0.5 for x in x_labels],
-#     labels = x_labels,
-# )
-# plt.gca().invert_yaxis()
-# plt.savefig("../plots/features.png", bbox_inches = 'tight')
-
-# plt.clf()
-# plt.title("Labels for features")
-# plt.plot(feature_labels)
-# plt.savefig("../plots/feature_labels.png", bbox_inches = 'tight')
-
-# plt.clf()
-# plt.title("Adjacent matrix")
-# plt.pcolormesh(adj_mat, cmap = 'viridis')
-# plt.colorbar()
-# plt.gca().invert_yaxis()
-# plt.savefig("../plots/adj_mat.png", bbox_inches = 'tight')
+# plot_raw_signals(
+#     signal_raw,
+#     fig = plt.figure(dpi = 300, layout = "tight"),
+#     file_path = "../plots/raw_signals")
+# plot_features(
+#     features,
+#     fig = plt.figure(dpi = 300, layout = "tight"),
+#     file_path = "../plots/features")
+# plot_adj_matrix(
+#     adj_matrix,
+#     fig = plt.figure(dpi = 300, layout = "tight"),
+#     file_path = "../plots/adj_matrix")
 
 features = torch.tensor(features, dtype = torch.double)
-edge_index, edge_attr = calc_edge_index_and_attr(
-    adj_mat,
-    need_undirected = True,
-)
+edge_index, edge_attr = calc_edge_index_and_attr(adj_matrix)
 
-train_mask = []
-test_mask = []
+train_mask = [False for _ in features]
+test_mask = [False for _ in features]
 for i, _ in enumerate(features):
-    is_train = False
-    is_test = False
-
     if i >= 0 and i < 10:
-        is_train = True
+        train_mask[i] = True
     elif i >= 10 and i < 15:
-        is_test = True
+        test_mask[i] = True
     elif i >= 15 and i < 150:
-        is_train = True
+        train_mask[i] = True
     elif i >= 150 and i < 200:
-        is_test = True
+        test_mask[i] = True
     elif i >= 200 and i < 275:
-        is_train = True
+        train_mask[i] = True
     elif i >= 275 and i < 300:
-        is_test = True
+        test_mask[i] = True
     elif i >= 300 and i < 345:
-        is_train = True
+        train_mask[i] = True
     elif i >= 345 and i < 360:
-        is_test = True
+        test_mask[i] = True
     elif i >= 360 and i < 428:
-        is_train = True
+        train_mask[i] = True
     elif i >= 427 and i < 450:
-        is_test = True
+        test_mask[i] = True
     elif i >= 450 and i < 488:
-        is_train = True
+        train_mask[i] = True
     elif i >= 487 and i < 500:
-        is_test = True
+        test_mask[i] = True
     elif i >= 500 and i < 575:
-        is_train = True
+        train_mask[i] = True
     elif i >= 575 and i < 600:
-        is_test = True
+        test_mask[i] = True
     elif i >= 600 and i < 780:
-        is_train = True
+        train_mask[i] = True
     elif i >= 780 and i < 840:
-        is_test = True
+        test_mask[i] = True
     elif i >= 840 and i < 966:
-        is_train = True
+        train_mask[i] = True
     else:
-        is_test = True
+        test_mask[i] = True
 
-    assert is_train or is_test
-    train_mask.append(is_train)
-    test_mask.append(is_test)
-
-train_mask = torch.tensor(train_mask, dtype = bool)
-test_mask = torch.tensor(test_mask, dtype = bool)
+train_mask = torch.tensor(train_mask)
+test_mask = torch.tensor(test_mask)
 
 data = Data(
     x = features,
     y = feature_labels,
     edge_index = edge_index,
     edge_attr = edge_attr,
-)
-
-data.train_mask = train_mask
-data.test_mask = test_mask
-data.class_count = 2
+    train_mask = train_mask,
+    test_mask = test_mask,
+    class_count = 2)
 
 epoch = 500
-test_n = 20
+model = GCNModel(data)
+model.go_training(epoch)
+model_result = model.go_testing()
 
-model = GCNConvOnly
-benchmark_model(
-    config_number = 1,
-    test_n = test_n,
-    data = data,
-    model_constructor = model,
-    epoch = epoch
-)
-
-model = GraphConvOnly
-benchmark_model(
-    config_number = 2,
-    test_n = test_n,
-    data = data,
-    model_constructor = model,
-    epoch = epoch
-)
-
-model = GATConvOnly
-benchmark_model(
-    config_number = 3,
-    test_n = test_n,
-    data = data,
-    model_constructor = model,
-    epoch = epoch
-)
+# plot_confusion_matrix(
+#     model_result,
+#     fig = plt.figure(dpi = 300, layout = "tight"),
+#     file_path = "../plots/confusion_matrix")
