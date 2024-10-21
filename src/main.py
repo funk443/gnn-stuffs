@@ -356,6 +356,18 @@ def plot_confusion_matrix(
     ax.set_xlabel("Predicted")
     ax.set_ylabel("Actual")
 
+    labels = [
+        ["True Positive", "False Negative"],
+        ["False Positive", "True Negative"]]
+    for i in range(len(labels)):
+        for j in range(len(labels[0])):
+            s = f"{labels[i][j]}: {confusion_matrix[i][j]}"
+            ax.text(
+                j, i, s,
+                color = "white",
+                ha = "center",
+                bbox = {"facecolor": "black"})
+
     if file_path is not None:
         fig.savefig(file_path)
     else:
