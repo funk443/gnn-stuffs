@@ -271,7 +271,7 @@ def plot_raw_signals(
     if fig is None:
         fig = plt.figure(layout = "tight")
 
-    fig.set_title("Raw signal")
+    fig.suptitle("Raw signal")
     xyzs = [
         [p[0] for p in signals],
         [p[1] for p in signals],
@@ -324,7 +324,8 @@ def plot_adj_matrix(
     cax = ax.imshow(
         adj_matrix,
         aspect = "auto",
-        interpolation = "none")
+        interpolation = "none",
+        cmap = "hot")
     cbar = fig.colorbar(cax)
 
     if file_path is not None:
