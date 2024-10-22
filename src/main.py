@@ -320,7 +320,7 @@ def plot_adj_matrix(
         fig = plt.figure(layout = "tight")
 
     ax = fig.add_subplot()
-    ax.set_title("Adjacent Matrix")
+    ax.set_title("Adjacent matrix")
     cax = ax.imshow(
         adj_matrix,
         aspect = "auto",
